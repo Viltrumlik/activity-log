@@ -72,11 +72,16 @@ def data_block(payload):
     return b"data " + str(len(blob)).encode("ascii") + b"\n" + blob + b"\n"
 
 
-def build_stream(start, end, min_commits, max_commits, rng):
-    """Yield the fast-import command stream, one chunk per commit."""
-    window = []
+def build_stream(start, end, min_commits, max_commits, rng, window=None, total=0,
+                 from_tip=False):
+    """Yield the fast-import command stream, one chunk per commit.
+
+    `window` and `total` seed the rolling log when appending, so the entry
+    numbering continues from the branch tip instead of restarting at 1.
+    """
+    window = list(window or [])
     mark = 0
-    total = 0
+    first = True
 
     day = start
     while day <= end:
@@ -105,7 +110,11 @@ def build_stream(start, end, min_commits, max_commits, rng):
             yield f"author {ident}\n".encode("utf-8")
             yield f"committer {ident}\n".encode("utf-8")
             yield data_block(rng.choice(MESSAGES))
-            # No `from` line: fast-import chains onto the branch tip itself.
+            if first and from_tip:
+                # fast-import only adopts a pre-existing branch tip when the
+                # stream's first commit names it; the rest chain implicitly.
+                yield f"from refs/heads/{BRANCH}^0\n".encode("ascii")
+            first = False
             yield f"M 100644 :{blob_mark} {LOG_PATH}\n\n".encode("utf-8")
 
         day += datetime.timedelta(days=1)
@@ -113,21 +122,42 @@ def build_stream(start, end, min_commits, max_commits, rng):
     yield b"done\n"
 
 
+def tip_state():
+    """Return (last day, log window, entry count) for the current branch tip.
+
+    Reads the committed blob rather than the worktree file so a dirty copy
+    cannot desync the numbering.
+    """
+    last = subprocess.run(
+        ["git", "log", "-1", "--format=%ad", "--date=format:%Y-%m-%d", BRANCH],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    blob = subprocess.run(
+        ["git", "show", f"{BRANCH}:{LOG_PATH}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    window = blob.splitlines()[-WINDOW:]
+    total = int(window[-1].rsplit(" entry ", 1)[1]) if window else 0
+    return datetime.date.fromisoformat(last), window, total
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", type=datetime.date.fromisoformat, default=DEFAULT_START)
+    parser.add_argument("--start", type=datetime.date.fromisoformat, default=None,
+                        help="default: DEFAULT_START, or the day after the tip with --append")
     parser.add_argument("--end", type=datetime.date.fromisoformat, default=datetime.date.today())
     parser.add_argument("--min", dest="min_commits", type=int, default=10)
     parser.add_argument("--max", dest="max_commits", type=int, default=50)
     parser.add_argument("--seed", type=int, default=None, help="fix the RNG for a reproducible run")
+    parser.add_argument("--append", action="store_true",
+                        help="extend an existing history instead of requiring a fresh repo")
     return parser.parse_args(argv)
 
 
 def main(argv):
     args = parse_args(argv)
 
-    if args.start > args.end:
-        sys.exit("Error: --start must not be after --end")
     if not 1 <= args.min_commits <= args.max_commits:
         sys.exit("Error: need 1 <= --min <= --max")
 
@@ -139,18 +169,32 @@ def main(argv):
         ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
         capture_output=True, text=True,
     )
-    if head.returncode == 0:
-        sys.exit("Error: this repo already has commits. Run in a fresh repo.")
+    if head.returncode == 0 and not args.append:
+        sys.exit("Error: this repo already has commits. Run in a fresh repo, or pass --append.")
+    if head.returncode != 0 and args.append:
+        sys.exit("Error: --append needs an existing history.")
 
-    days = (args.end - args.start).days + 1
-    print(f"{days} kun: {args.start} -> {args.end}, kuniga {args.min_commits}-{args.max_commits} commit")
+    if args.append:
+        last_day, window, total = tip_state()
+        start = args.start or last_day + datetime.timedelta(days=1)
+        if start <= last_day:
+            sys.exit(f"Error: --start must be after the last commit ({last_day})")
+    else:
+        start, window, total = args.start or DEFAULT_START, [], 0
+
+    if start > args.end:
+        sys.exit("Error: --start must not be after --end")
+
+    days = (args.end - start).days + 1
+    print(f"{days} kun: {start} -> {args.end}, kuniga {args.min_commits}-{args.max_commits} commit")
 
     rng = random.Random(args.seed)
     proc = subprocess.Popen(
         ["git", "fast-import", "--quiet", "--done"],
         stdin=subprocess.PIPE,
     )
-    for chunk in build_stream(args.start, args.end, args.min_commits, args.max_commits, rng):
+    for chunk in build_stream(start, args.end, args.min_commits, args.max_commits, rng,
+                              window, total, from_tip=args.append):
         proc.stdin.write(chunk)
     proc.stdin.close()
 
