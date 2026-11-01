@@ -178,7 +178,9 @@ def main(argv):
         last_day, window, total = tip_state()
         start = args.start or last_day + datetime.timedelta(days=1)
         if start <= last_day:
-            sys.exit(f"Error: --start must be after the last commit ({last_day})")
+            # Backfilling days the tip has already passed is fine: the parent
+            # chain is unaffected and GitHub buckets a commit by author date.
+            print(f"Note: backfilling from {start}, behind the tip ({last_day})")
     else:
         start, window, total = args.start or DEFAULT_START, [], 0
 
